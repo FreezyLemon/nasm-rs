@@ -15,10 +15,11 @@ readme = "README.markdown"
 repository = "https://github.com/medek/nasm-rs"
 version = "0.2.5"
 edition = "2018"
+rust-version = "1.59"
 
-[dependencies.rayon]
-optional = true
-version = "1.4"
+[dependencies]
+once_cell = { version = "1.19", optional = true }
+jobserver = { version = "0.1", optional = true }
 
 [features]
-parallel = ["rayon"]
+parallel = ["dep:jobserver", "dep:once_cell"]

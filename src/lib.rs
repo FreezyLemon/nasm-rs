@@ -1,11 +1,32 @@
-#[cfg(feature = "parallel")]
-use rayon::prelude::*;
-
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
+
+#[cfg(feature = "parallel")]
+use jobserver::*;
+#[cfg(feature = "parallel")]
+use once_cell::sync::Lazy;
+
+#[cfg(feature = "parallel")]
+pub static JOBSERVER: Lazy<Client> = Lazy::new(|| {
+    use std::thread::available_parallelism;
+    use std::num::NonZeroUsize;
+
+    match unsafe { Client::from_env() } {
+        Some(c) => c,
+        None => {
+            // Fall back to creating our own jobserver
+            let cpus: usize = env::var("NUM_JOBS").ok()
+                .and_then(|s| s.parse().ok())
+                .or_else(|| available_parallelism().map(NonZeroUsize::get).ok())
+                .unwrap_or(4);
+
+            Client::new(cpus).expect("can create jobserver")
+        }
+    }
+});
 
 fn x86_triple(os: &str) -> (&'static str, &'static str) {
     match os {
@@ -251,9 +272,35 @@ impl Build {
         );
         let dst = &self.get_out_dir();
 
-        self.make_iter()
-            .map(|file| self.compile_file(&nasm, file.as_ref(), &args, src, dst))
-            .collect::<Result<Vec<_>, String>>()
+        Self::compile_objects_inner(&self.files, &nasm, &args, src, dst)
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    fn compile_objects_inner(files: &[PathBuf], nasm: &Path, args: &[&str], src: &Path, dst: &Path) -> Result<Vec<PathBuf>, String> {
+        files.iter()
+            .map(|file| Self::compile_file(nasm, file, args, src, dst))
+            .collect()
+    }
+
+    #[cfg(feature = "parallel")]
+    fn compile_objects_inner(files: &[PathBuf], nasm: &Path, args: &[&str], src: &Path, dst: &Path) -> Result<Vec<PathBuf>, String> {
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(files.len());
+
+            for file in files {
+                let token = JOBSERVER.acquire().expect("can acquire job token");
+                let new_handle = s.spawn(move || {
+                    let result = Self::compile_file(nasm, file, &args, src, dst);
+                    drop(token);
+                    result
+                });
+                handles.push(new_handle);
+            }
+
+            handles.into_iter()
+                .map(|h| h.join().map_err(|_| String::from("build thread panicked"))?)
+                .collect::<Result<Vec<_>, String>>()
+        })
     }
 
     fn get_args(&self, target: &str) -> Vec<&str> {
@@ -271,18 +318,7 @@ impl Build {
         args
     }
 
-    #[cfg(feature = "parallel")]
-    fn make_iter(&self) -> rayon::slice::Iter<PathBuf> {
-        self.files.par_iter()
-    }
-
-    #[cfg(not(feature = "parallel"))]
-    fn make_iter(&self) -> std::slice::Iter<'_, PathBuf> {
-        self.files.iter()
-    }
-
     fn compile_file(
-        &self,
         nasm: &Path,
         file: &Path,
         new_args: &[&str],
