@@ -42,7 +42,7 @@ fn parse_triple(trip: &str) -> (&'static str, &'static str) {
             } else {
                 x86_64_triple(parts[2])
             }
-        },
+        }
         "x86" | "i386" | "i586" | "i686" => x86_triple(parts[2]),
         _ => ("", "-g"),
     }
@@ -319,9 +319,11 @@ impl Build {
                 });
                 handles.push(handle);
             }
-            
-            handles.into_iter()
-                .map(|h| h.join().map_err(|_| String::from("build thread panicked"))?)
+
+            // TODO: How to handle thread panics?
+            handles
+                .into_iter()
+                .map(|h| h.join().map_err(|_| "build thread panicked".to_string())?)
                 .collect::<Result<Vec<_>, String>>()
         })
     }
