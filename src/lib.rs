@@ -284,40 +284,52 @@ impl Build {
         let jobserver = JOBSERVER.get_or_init(|| {
             // Try getting a jobserver from the environment (cargo, make, ...)
             unsafe { Client::from_env() }.unwrap_or_else(|| {
-                // Create our own jobserver based on NUM_JOBS
+                // If that fails, create our own jobserver based on NUM_JOBS
                 let job_limit: usize = env::var("NUM_JOBS")
                     .expect("NUM_JOBS must be set")
                     .parse()
                     .expect("NUM_JOBS must be parsable to usize");
 
-                Client::new(job_limit).expect("Creating a job server failed")
+                // Reserve a job token for this process so the behavior
+                // is consistent with external job servers.
+                let client = Client::new(job_limit).expect("Failed to create a job server");
+                client.acquire_raw().expect("Failed to acquire initial job token");
+                client
             })
         });
 
-        let thread_results: Vec<_> = std::thread::scope(|s| {
-            let handles: Vec<_> = files
-                .iter()
-                .map(|file| {
-                    // Wait for a job token before starting the build
-                    let token = jobserver.acquire().expect("can acquire job token");
-                    s.spawn(move || {
-                        let result = Self::compile_file(nasm, file, args, src, dst);
+        // Release the implicit job token for this process while NASM is running.
+        // Without this, the maximum number of NASM processes would be (NUM_JOBS - 1).
+        // This would mean that a build process with NUM_JOBS=1 would have 
+        // no tokens left for NASM to run, causing the build to stall.
+        jobserver.release_raw().unwrap();
 
-                        // Release the token ASAP so that another job can start
-                        drop(token);
-                        result
-                    })
-                })
-                .collect();
+        let thread_results: Vec<_> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(files.len());
+
+            for file in files {
+                // Wait for a job token before starting the build
+                let token = jobserver.acquire().expect("Failed to acquire job token");
+                let handle = s.spawn(move || {
+                    let result = Self::compile_file(nasm, file, args, src, dst);
+                    // Release the token ASAP so that another job can start
+                    drop(token);
+                    result
+                });
+                handles.push(handle);
+            }
 
             // Collect results from all threads without handling panics
             handles.into_iter().map(|h| h.join()).collect()
         });
 
-        // Unwind possible panics after all threads have stopped
+        // Reacquire the implicit job token (see comments above for more info).
+        jobserver.acquire_raw().expect("Failed to reacquire implicit token");
+
+        // Only handle thread panics after all threads have stopped
         thread_results
             .into_iter()
-            .map(|r| r.unwrap_or_else(|e| panic::resume_unwind(e)))
+            .map(|thread_res| thread_res.unwrap_or_else(|e| panic::resume_unwind(e)))
             .collect()
     }
 
