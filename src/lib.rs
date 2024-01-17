@@ -5,28 +5,10 @@ use std::process::Command;
 use std::process::Stdio;
 
 #[cfg(feature = "parallel")]
-use jobserver::*;
-#[cfg(feature = "parallel")]
-use once_cell::sync::Lazy;
+use jobserver::Client;
 
 #[cfg(feature = "parallel")]
-pub static JOBSERVER: Lazy<Client> = Lazy::new(|| {
-    use std::thread::available_parallelism;
-    use std::num::NonZeroUsize;
-
-    match unsafe { Client::from_env() } {
-        Some(c) => c,
-        None => {
-            // Fall back to creating our own jobserver
-            let cpus: usize = env::var("NUM_JOBS").ok()
-                .and_then(|s| s.parse().ok())
-                .or_else(|| available_parallelism().map(NonZeroUsize::get).ok())
-                .unwrap_or(4);
-
-            Client::new(cpus).expect("can create jobserver")
-        }
-    }
-});
+pub static JOBSERVER: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
 
 fn x86_triple(os: &str) -> (&'static str, &'static str) {
     match os {
@@ -276,27 +258,68 @@ impl Build {
     }
 
     #[cfg(not(feature = "parallel"))]
-    fn compile_objects_inner(files: &[PathBuf], nasm: &Path, args: &[&str], src: &Path, dst: &Path) -> Result<Vec<PathBuf>, String> {
-        files.iter()
+    fn compile_objects_inner(
+        files: &[PathBuf],
+        nasm: &Path,
+        args: &[&str],
+        src: &Path,
+        dst: &Path,
+    ) -> Result<Vec<PathBuf>, String> {
+        files
+            .iter()
             .map(|file| Self::compile_file(nasm, file, args, src, dst))
             .collect()
     }
 
     #[cfg(feature = "parallel")]
-    fn compile_objects_inner(files: &[PathBuf], nasm: &Path, args: &[&str], src: &Path, dst: &Path) -> Result<Vec<PathBuf>, String> {
+    fn compile_objects_inner(
+        files: &[PathBuf],
+        nasm: &Path,
+        args: &[&str],
+        src: &Path,
+        dst: &Path,
+    ) -> Result<Vec<PathBuf>, String> {
+        let jobserver = JOBSERVER.get_or_init(|| {
+            use std::thread::available_parallelism;
+
+            // Try getting a jobserver from the environment (cargo, make, ...)
+            match unsafe { Client::from_env() } {
+                Some(c) => c,
+                None => {
+                    // We need to create our own jobserver.
+                    // Get a sensible job limit from the environment or fall back to 4.
+                    let mut job_limit = None;
+
+                    if let Ok(num_str) = env::var("NUM_JOBS") {
+                        if let Ok(num) = num_str.parse() {
+                            job_limit = Some(num);
+                        }
+                    }
+
+                    if job_limit.is_none() {
+                        if let Ok(num) = available_parallelism() {
+                            job_limit = Some(num.get());
+                        }
+                    }
+
+                    Client::new(job_limit.unwrap_or(4)).expect("can create jobserver")
+                }
+            }
+        });
+
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(files.len());
 
             for file in files {
-                let token = JOBSERVER.acquire().expect("can acquire job token");
-                let new_handle = s.spawn(move || {
-                    let result = Self::compile_file(nasm, file, &args, src, dst);
+                let token = jobserver.acquire().expect("can acquire job token");
+                let handle = s.spawn(move || {
+                    let result = Self::compile_file(nasm, file, args, src, dst);
                     drop(token);
                     result
                 });
-                handles.push(new_handle);
+                handles.push(handle);
             }
-
+            
             handles.into_iter()
                 .map(|h| h.join().map_err(|_| String::from("build thread panicked"))?)
                 .collect::<Result<Vec<_>, String>>()
@@ -507,8 +530,7 @@ fn test_parse_nasm_version() {
 fn test_parse_triple() {
     let triple = "x86_64-unknown-linux-gnux32";
     assert_eq!(parse_triple(&triple), ("-felfx32", "-gdwarf"));
-    
+
     let triple = "x86_64-unknown-linux";
     assert_eq!(parse_triple(&triple), ("-felf64", "-gdwarf"));
 }
-
