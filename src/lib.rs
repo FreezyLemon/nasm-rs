@@ -279,53 +279,46 @@ impl Build {
         src: &Path,
         dst: &Path,
     ) -> Result<Vec<PathBuf>, String> {
+        use std::panic;
+
         let jobserver = JOBSERVER.get_or_init(|| {
-            use std::thread::available_parallelism;
-
             // Try getting a jobserver from the environment (cargo, make, ...)
-            match unsafe { Client::from_env() } {
-                Some(c) => c,
-                None => {
-                    // We need to create our own jobserver.
-                    // Get a sensible job limit from the environment or fall back to 4.
-                    let mut job_limit = None;
+            unsafe { Client::from_env() }.unwrap_or_else(|| {
+                // Create our own jobserver based on NUM_JOBS
+                let job_limit: usize = env::var("NUM_JOBS")
+                    .expect("NUM_JOBS must be set")
+                    .parse()
+                    .expect("NUM_JOBS must be parsable to usize");
 
-                    if let Ok(num_str) = env::var("NUM_JOBS") {
-                        if let Ok(num) = num_str.parse() {
-                            job_limit = Some(num);
-                        }
-                    }
-
-                    if job_limit.is_none() {
-                        if let Ok(num) = available_parallelism() {
-                            job_limit = Some(num.get());
-                        }
-                    }
-
-                    Client::new(job_limit.unwrap_or(4)).expect("can create jobserver")
-                }
-            }
+                Client::new(job_limit).expect("Creating a job server failed")
+            })
         });
 
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(files.len());
+        let thread_results: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = files
+                .iter()
+                .map(|file| {
+                    // Wait for a job token before starting the build
+                    let token = jobserver.acquire().expect("can acquire job token");
+                    s.spawn(move || {
+                        let result = Self::compile_file(nasm, file, args, src, dst);
 
-            for file in files {
-                let token = jobserver.acquire().expect("can acquire job token");
-                let handle = s.spawn(move || {
-                    let result = Self::compile_file(nasm, file, args, src, dst);
-                    drop(token);
-                    result
-                });
-                handles.push(handle);
-            }
+                        // Release the token ASAP so that another job can start
+                        drop(token);
+                        result
+                    })
+                })
+                .collect();
 
-            // TODO: How to handle thread panics?
-            handles
-                .into_iter()
-                .map(|h| h.join().map_err(|_| "build thread panicked".to_string())?)
-                .collect::<Result<Vec<_>, String>>()
-        })
+            // Collect results from all threads without handling panics
+            handles.into_iter().map(|h| h.join()).collect()
+        });
+
+        // Unwind possible panics after all threads have stopped
+        thread_results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|e| panic::resume_unwind(e)))
+            .collect()
     }
 
     fn get_args(&self, target: &str) -> Vec<&str> {
